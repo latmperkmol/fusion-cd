@@ -1,5 +1,5 @@
 """
-Fuse images from different sensors using the principals of multivariate alteration detection.
+Fuse images from different sensors using the principles of multivariate alteration detection.
 
 @author: Nick Leach
 """
@@ -10,10 +10,63 @@ import rasterio.mask
 import rasterio.features
 import fiona
 import numpy as np
+import numpy.ma as ma
 from geopandas import GeoDataFrame
 import pandas as pd
 from shapely.geometry import shape
 import datetime
+import gdal
+import osr
+import time
+# weird and janky, but works until these libraries are combined
+try:
+    from despike import despike
+    import segment_fitter as sf
+except ModuleNotFoundError:
+    os.chdir(r"C:\Users\nleach\PycharmProjects\untitled")
+    from despike import despike
+    import segment_fitter as sf
+
+
+def qa_mask(qa_band):
+    """
+    Create a binary mask based on which pixels are flipped in the QA band.
+    By default, excludes cirrus, clouds, adjacent cloud, cloud shadow, and snow/ice.
+    :param qa_band: (8int 1D np array)
+    """
+    clear = [0, 32, 64, 96, 128, 160, 192, 224]  # good pixels
+    ones = np.ones(np.shape(qa_band))
+    msk = np.isin(qa_band, clear)  # create binary array, where the clear pixels are marked as True
+    out = ma.masked_array(ones, ~msk)  # mask everything except the clear pixels
+    return out
+
+
+def read_hdf_to_arr(hdf_path, band, datatype=np.int16):
+    """
+    Functionalizing the process of reading HDF files into arrays
+    read a single band out of the hdf and load it into a numpy array
+    """
+    if os.path.isfile(hdf_path):
+        src = gdal.Open(hdf_path)
+        band_ds = gdal.Open(src.GetSubDatasets()[band][0], gdal.GA_ReadOnly)
+        band_array = band_ds.ReadAsArray().astype(datatype)
+        del src
+        return band_array
+    else:
+        print("That file does not exist")
+        return
+
+
+def get_hdf_transform(hdf_path):
+    if os.path.isfile(hdf_path):
+        src = gdal.Open(hdf_path)
+        band_ds = gdal.Open(src.GetSubDatasets()[0][0], gdal.GA_ReadOnly)
+        prj = band_ds.GetProjection()
+        srs = osr.SpatialReference(wkt=prj)
+        return prj, srs
+    else:
+        print("That file does not exist")
+        return
 
 
 def clip_to_shapefile(raster, shapefile, outname="clipped_raster.tif", outdir=None):
@@ -114,7 +167,8 @@ def get_ncp(mad_img, save_image=False, out_path=None):
 
 def parse_hls_filepath(filepath):
     """
-    Creates a dictionary with some basic info about the input HLS image
+    Creates a dictionary with some basic info about the input HLS image based on its filename.
+    Assumes default filenames.
     :param filepath: (string)
     :return: (dict)
     """
@@ -149,7 +203,7 @@ def collect_image_info(directory, image_type="hls"):
     """
     Get basic info about every HLS image in directory.
     Return a dictionary. Keys are filepaths, values are other dictionaries with info about the filepath
-    :param directory: (string)
+    :param directory: (string) file extension, year, day of year, month, day of month, datetime object
     :param image_type: (string) either "hls" or "ps".
     :return: (dict)
     """
@@ -169,8 +223,6 @@ def collect_image_info(directory, image_type="hls"):
     return image_info_all
 
 
-# TODO: change this so that it takes in the dictionary of HLS images rather than just the datetime objects.
-    # that will make it a lot easier to grab the correct image for the normalization process
 def find_closest_date(image_date, parsed_files):
     """
     Return index of list_of_dates with the date closest to image_date.
@@ -185,7 +237,87 @@ def find_closest_date(image_date, parsed_files):
         date_differences.append([(image_date - parsed_files[ref]["datetime"]).days, ref])  # positive when image_date is later than test date
         # this method means that the preference is to normalize to images earlier in the year
     idx_min = np.argmin([abs(d[0]) for d in date_differences])  # index of the date in list which is closest to image_date
+    date_differences = np.asarray(date_differences)  # TODO: UNTESTED conversion
     nearest_image = date_differences[idx_min][1]
     return nearest_image
 
 
+def fit_time_series(hls_dir, despike_thresh=0.10, max_segs=10, seg_thresh=0.05, start_year=2016,
+                    nodata_val=0.0, verbose=True):
+    """
+    Loads in all the HLS arrays in hls_dir. For each pixel location, the NDVI is calculated and corresponding dates
+    extracted. These values are then despiked and fit with linear segments.
+    :param hls_dir:
+    :param despike_thresh:
+    :param max_segs:
+    :param seg_thresh:
+    :param start_year:
+    :param nodata_val:
+    :param verbose:
+    :return all_pixel_data: tuple with (ndvi, despiked, segs, keepers)
+    """
+    # use a timer!
+    start = time.time()
+    hls_fileinfo = collect_image_info(hls_dir)  # collect info on all HLS images
+
+    # get all dates, counting from 2016-01-01 by default
+    series_dates = []
+    for img in hls_fileinfo:
+        series_dates.append(hls_fileinfo[img]['doy'] + (hls_fileinfo[img]['year']-start_year)*365)
+    sorted_dates = sorted(series_dates)  # want a sorted version since the dates may initially be grouped by sensor
+
+    # load in all the HLS arrays
+    hls_arrays = []
+    for dirpath, dirnames, filenames in os.walk(hls_dir):
+        for img in [f for f in filenames if f.endswith(".tif")]:
+            img_path = os.path.join(dirpath, img)
+            with rasterio.open(img_path) as src:
+                hls_arrays.append(src.read())
+
+    # get dimensions for the HLS images (should all have identical dimensions)
+    bands = hls_arrays[0].shape[0]
+    rows = hls_arrays[0].shape[1]
+    cols = hls_arrays[0].shape[2]
+
+    all_pixel_data = []
+    for row in range(rows):
+        row_data = []
+        for col in range(cols):
+            series = []
+            for band in range(bands):
+                # read in the corresponding series (one pixel through all time and bands)
+                series.append([arr[band][row][col] for arr in hls_arrays])
+            ndvi = np.array((np.array(series[3]) - np.array(series[2])) / (
+                        np.array(series[3]) + np.array(series[2])))  # ndvi of array
+            del series
+            # sort the ndvi series based on dates (remember, dates are originally unorderd - L30 then S30)
+            ndvi = np.array([x for y, x in sorted(zip(series_dates, ndvi))])
+            # remove dates where the pixel has been masked/satured
+            keepers = []
+            for pix in ndvi:
+                if pix == nodata_val:
+                    keepers.append(False)
+                else:
+                    keepers.append(True)
+            keepers = np.array(keepers)
+            # add the ndvi series for this position to a list of arrays
+            # also add despiked values and segs
+            # if (ndvi > 0) <= 3, just write some 0s. Otherwise, enter a try/except block
+            if len(keepers[keepers > 0]) > 3:  # need at least 4 points to run the segment fitter
+                try:
+                    despiked = despike(ndvi[keepers], despike_thresh)[1]
+                    segs = sf.seg_fit(despiked, max_segs, seg_thresh, np.array(sorted_dates)[keepers])
+                    row_data.append((ndvi, despiked, segs, keepers))
+                except:
+                    print("Issue at row " + str(row) + " and col " + str(col))
+                    row_data.append((ndvi, np.zeros_like(ndvi), np.zeros_like(ndvi), keepers))
+            else:  # if there aren't enough points to segment fit, append all zeros
+                print("Not enough valid data at row " + str(row) + " and col " + str(col))
+                row_data.append((ndvi, np.zeros_like(ndvi), np.zeros_like(ndvi), keepers))
+        all_pixel_data.append(row_data)
+        if verbose:
+            if row % 10 == 0:
+                print("Finished row " + str(row) + " after " + str(int(time.time()-start)) + " seconds. ")
+    end = time.time()
+    print("Total time elapsed: " + str(int(end-start)) + " seconds.")
+    return all_pixel_data
