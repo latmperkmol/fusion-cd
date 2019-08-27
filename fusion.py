@@ -8,6 +8,9 @@ import os
 import rasterio
 import rasterio.mask
 import rasterio.features
+import rasterio.warp
+from rasterio.enums import Resampling
+import affine
 import fiona
 import numpy as np
 import numpy.ma as ma
@@ -17,6 +20,7 @@ from shapely.geometry import shape
 import datetime
 import gdal
 import osr
+from osgeo.gdalconst import GDT_UInt16
 import time
 # weird and janky, but works until these libraries are combined
 try:
@@ -242,12 +246,57 @@ def find_closest_date(image_date, parsed_files):
     return nearest_image
 
 
-def fit_time_series(hls_dir, despike_thresh=0.10, max_segs=10, seg_thresh=0.05, start_year=2016,
-                    nodata_val=0.0, verbose=True):
+def buffer_and_downsample(target_image, reference_image, outname="reprojected.tif", outdir=None, dst_nodata=0.0,
+                          dst_dtype='uint16', resample=Resampling.cubic):
+    """
+    Resample target_image to match resolution of reference_image. If reference_image is larger than target_image, then
+    buffer target_image with no-data values so that it has the same width and height as reference_image.
+    :param target_image: (str) file path of the image with the data to be resampled
+    :param reference_image: (str) file path of the image with the desired resolution and extent
+    :param dst_nodata: (numeric) no-data value for the output image
+    :param dst_dtype: (str) data type for the output image
+    :param outname: (str) name of output file
+    :param outdir: (str) directory to save output image. If not given, image will be saved in working directory
+    :param resample: rasterio resampling method, e.g. Resample.bilinear, Resample.cubic
+    :return:
+    """
+    outpath = os.path.join(outdir, outname)
+
+    with rasterio.open(target_image, 'r') as src:
+        tgt_data = src.read()
+        tgt_meta = src.profile
+    tgt_resolution = tgt_meta['transform'][0]  # in meters. Assumes square pixels
+    with rasterio.open(reference_image, 'r') as src:
+        ref_meta = src.profile
+    dst_res = ref_meta['transform'][0]   # destination resolution in meters. Assumes square pixels
+    left = ref_meta['transform'][2]
+    top = ref_meta['transform'][5]
+    right = left + ref_meta['width']*dst_res
+    bottom = top + ref_meta['height']*dst_res
+    new_transform = affine.Affine(dst_res, 0., left, 0., -1.*dst_res, top)  # transformation for new image to be saved
+    dst_raster = np.zeros((ref_meta['count'], ref_meta['height'], ref_meta['width']), dtype=dst_dtype)  # store data
+    # reproject the data from target_image into the array dst_raster using the new transformation and the resolution of
+    # the reference_image
+    rasterio.warp.reproject(tgt_data, dst_raster, src_transform=tgt_meta['transform'], dst_transform=new_transform,
+                            src_crs=tgt_meta['crs'], dst_crs=ref_meta['crs'], dst_nodata=dst_nodata,
+                            src_nodata=tgt_meta['nodata'], resampling=resample)
+    # update the meta for the output file
+    dst_profile = ref_meta
+    dst_profile['transform'] = new_transform
+    dst_profile['nodata'] = dst_nodata
+    dst_profile['dtype'] = dst_dtype
+    with rasterio.open(outpath, 'w', **dst_profile) as dst:
+        dst.write(dst_raster)
+    return outpath
+
+
+def fit_time_series(hls_dir, ps_dir=None, despike_thresh=0.10, max_segs=10, seg_thresh=0.05, start_year=2016,
+                    nodata_val=-1000, verbose=True):
     """
     Loads in all the HLS arrays in hls_dir. For each pixel location, the NDVI is calculated and corresponding dates
     extracted. These values are then despiked and fit with linear segments.
     :param hls_dir:
+    :param ps_dir:
     :param despike_thresh:
     :param max_segs:
     :param seg_thresh:
@@ -259,11 +308,21 @@ def fit_time_series(hls_dir, despike_thresh=0.10, max_segs=10, seg_thresh=0.05, 
     # use a timer!
     start = time.time()
     hls_fileinfo = collect_image_info(hls_dir)  # collect info on all HLS images
+    if ps_dir:
+        ps_fileinfo = collect_image_info(ps_dir, image_type="ps")
+    else:
+        ps_fileinfo = None  # just to meet PEP guidelines
 
     # get all dates, counting from 2016-01-01 by default
     series_dates = []
     for img in hls_fileinfo:
         series_dates.append(hls_fileinfo[img]['doy'] + (hls_fileinfo[img]['year']-start_year)*365)
+    if ps_dir:
+        ps_dates = []
+        for img in ps_fileinfo:
+            ps_dates.append(ps_fileinfo[img]['doy'] + (ps_fileinfo[img]['year']-start_year)*365)
+        series_dates = series_dates + ps_dates
+    # Need to keep track of which dates belong to HLS and which belong to PS
     sorted_dates = sorted(series_dates)  # want a sorted version since the dates may initially be grouped by sensor
 
     # load in all the HLS arrays
