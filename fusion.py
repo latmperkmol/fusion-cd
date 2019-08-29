@@ -5,6 +5,7 @@ Fuse images from different sensors using the principles of multivariate alterati
 """
 
 import os
+import sys
 import rasterio
 import rasterio.mask
 import rasterio.features
@@ -27,7 +28,7 @@ try:
     from despike import despike
     import segment_fitter as sf
 except ModuleNotFoundError:
-    os.chdir(r"C:\Users\nleach\PycharmProjects\untitled")
+    sys.path.insert(1, r"C:\Users\nleach\PycharmProjects\untitled")
     from despike import despike
     import segment_fitter as sf
 
@@ -205,7 +206,7 @@ def parse_ps_filepath(filepath):
 
 def collect_image_info(directory, image_type="hls"):
     """
-    Get basic info about every HLS image in directory.
+    Get basic info about every image in directory.
     Return a dictionary. Keys are filepaths, values are other dictionaries with info about the filepath
     :param directory: (string) file extension, year, day of year, month, day of month, datetime object
     :param image_type: (string) either "hls" or "ps".
@@ -222,7 +223,7 @@ def collect_image_info(directory, image_type="hls"):
         for f in [f for f in all_filepaths if f.endswith(".tif")]:
             image_info_all[f] = parse_hls_filepath(f)
     else:
-        for f in [f for f in all_filepaths if f.endswith("merge.tif")]:
+        for f in [f for f in all_filepaths if f.endswith("merge.tif") or f.endswith("FINAL.tif")]:
             image_info_all[f] = parse_ps_filepath(f)
     return image_info_all
 
@@ -290,20 +291,17 @@ def buffer_and_downsample(target_image, reference_image, outname="reprojected.ti
     return outpath
 
 
-def fit_time_series(hls_dir, ps_dir=None, despike_thresh=0.10, max_segs=10, seg_thresh=0.05, start_year=2016,
-                    nodata_val=-1000, verbose=True):
+def build_time_series(hls_dir, ps_dir=None, start_year=2016, nodata_val=-1000, verbose=True):
     """
-    Loads in all the HLS arrays in hls_dir. For each pixel location, the NDVI is calculated and corresponding dates
-    extracted. These values are then despiked and fit with linear segments.
-    :param hls_dir:
-    :param ps_dir:
-    :param despike_thresh:
-    :param max_segs:
-    :param seg_thresh:
-    :param start_year:
-    :param nodata_val:
-    :param verbose:
-    :return all_pixel_data: tuple with (ndvi, despiked, segs, keepers)
+    Loads in all the HLS arrays in hls_dir. If ps_dir is given, then PS data is also loaded.
+    For each pixel location, the NDVI is calculated and corresponding dates extracted.
+    If a pixel is masked/no-data, it is marked as False in 'keepers'
+    :param hls_dir: (str) directory with HLS images. May contain subdirectories
+    :param ps_dir: (str) direcotry with PS images, each ending with "FINAL.TIF". May contain subdirectories
+    :param start_year: (int) Year of first image
+    :param nodata_val: (numeric) no-data value in images. NB: currently requires PS and HLS images to have same no-data
+    :param verbose: (bool) if True, prints off each time a row is finished
+    :return all_pixel_data: tuple with (ndvi, keepers, is_hls)
     """
     # use a timer!
     start = time.time()
@@ -315,14 +313,16 @@ def fit_time_series(hls_dir, ps_dir=None, despike_thresh=0.10, max_segs=10, seg_
 
     # get all dates, counting from 2016-01-01 by default
     series_dates = []
+    is_hls = []  # sort of janky, but we can use this to keep track of which images came from HLS or PS
     for img in hls_fileinfo:
         series_dates.append(hls_fileinfo[img]['doy'] + (hls_fileinfo[img]['year']-start_year)*365)
+        is_hls.append(True)  # place an identifier in is_hls for each added date
     if ps_dir:
         ps_dates = []
         for img in ps_fileinfo:
             ps_dates.append(ps_fileinfo[img]['doy'] + (ps_fileinfo[img]['year']-start_year)*365)
+            is_hls.append(False)  # identify these dates as not HLS
         series_dates = series_dates + ps_dates
-    # Need to keep track of which dates belong to HLS and which belong to PS
     sorted_dates = sorted(series_dates)  # want a sorted version since the dates may initially be grouped by sensor
 
     # load in all the HLS arrays
@@ -332,8 +332,19 @@ def fit_time_series(hls_dir, ps_dir=None, despike_thresh=0.10, max_segs=10, seg_
             img_path = os.path.join(dirpath, img)
             with rasterio.open(img_path) as src:
                 hls_arrays.append(src.read())
+    # load in all the normalized downsampled PS arrays, if provided
+    if ps_dir:
+        ps_arrays = []
+        for dirpath, dirnames, filenames in os.walk(ps_dir):
+            for img in [f for f in filenames if f.endswith("FINAL.tif")]:
+                img_path = os.path.join(dirpath, img)
+                with rasterio.open(img_path) as src:
+                    ps_arrays.append(src.read())
+        img_arrays = hls_arrays + ps_arrays
+    else:
+        img_arrays = hls_arrays
 
-    # get dimensions for the HLS images (should all have identical dimensions)
+    # get dimensions for the HLS images (should all have identical dimensions; PS images should have same too)
     bands = hls_arrays[0].shape[0]
     rows = hls_arrays[0].shape[1]
     cols = hls_arrays[0].shape[2]
@@ -349,34 +360,95 @@ def fit_time_series(hls_dir, ps_dir=None, despike_thresh=0.10, max_segs=10, seg_
             ndvi = np.array((np.array(series[3]) - np.array(series[2])) / (
                         np.array(series[3]) + np.array(series[2])))  # ndvi of array
             del series
-            # sort the ndvi series based on dates (remember, dates are originally unorderd - L30 then S30)
+            # sort the ndvi series based on dates (remember, dates are originally unordered - L30 then S30)
             ndvi = np.array([x for y, x in sorted(zip(series_dates, ndvi))])
-            # remove dates where the pixel has been masked/satured
+            # sort the HLS identifiers to match the dates
+            is_hls = np.array([x for y, x in sorted(zip(series_dates, is_hls))])
+            # remove dates where the pixel has been masked/saturated
             keepers = []
             for pix in ndvi:
-                if pix == nodata_val:
+                if pix == 0.0:  # use 0.0 since NDVI will also be precisely 0.0 when there is no-data in all bands
                     keepers.append(False)
                 else:
                     keepers.append(True)
             keepers = np.array(keepers)
             # add the ndvi series for this position to a list of arrays
-            # also add despiked values and segs
-            # if (ndvi > 0) <= 3, just write some 0s. Otherwise, enter a try/except block
-            if len(keepers[keepers > 0]) > 3:  # need at least 4 points to run the segment fitter
-                try:
-                    despiked = despike(ndvi[keepers], despike_thresh)[1]
-                    segs = sf.seg_fit(despiked, max_segs, seg_thresh, np.array(sorted_dates)[keepers])
-                    row_data.append((ndvi, despiked, segs, keepers))
-                except:
-                    print("Issue at row " + str(row) + " and col " + str(col))
-                    row_data.append((ndvi, np.zeros_like(ndvi), np.zeros_like(ndvi), keepers))
-            else:  # if there aren't enough points to segment fit, append all zeros
-                print("Not enough valid data at row " + str(row) + " and col " + str(col))
-                row_data.append((ndvi, np.zeros_like(ndvi), np.zeros_like(ndvi), keepers))
-        all_pixel_data.append(row_data)
+            row_data.append((ndvi, keepers, is_hls))
+        all_pixel_data.append(row_data)  # this will store it in rows... is that what we want? or better to 'unzip'?
         if verbose:
             if row % 10 == 0:
                 print("Finished row " + str(row) + " after " + str(int(time.time()-start)) + " seconds. ")
     end = time.time()
     print("Total time elapsed: " + str(int(end-start)) + " seconds.")
+    return all_pixel_data, np.array(sorted_dates)
+
+
+def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_segs=10, seg_thresh=0.05, is_hls=None,
+                          include_ps=True):
+    """
+    Given a time series for a single (pixel) location, calculate the despiked values and segment values.
+    Requires the dates associated with each image and a boolean array stating which values to keep (True) and to ignore.
+    If the input values come from a mix of HLS and PS, this can also use only the HLS values.
+    :param ndvi:
+    :param keepers:
+    :param sorted_dates:
+    :param despike_thresh:
+    :param max_segs:
+    :param seg_thresh:
+    :param is_hls:
+    :param include_ps:
+    :return:
+    """
+    # note that this is writing out lists instead of tuples. which is better??
+    despike_and_segs = []
+    # if no is_hls array is given, make one that is all True
+    if is_hls is calc_despike_and_segs.__defaults__[3]:
+        is_hls = np.full(ndvi.shape, True)
+    if not include_ps:
+        valid_images = is_hls & keepers
+    else:
+        valid_images = keepers
+    # Need at least 4 valid images in order to fit segments
+    if len(valid_images[valid_images > 0]) > 3:
+        try:
+            despiked = despike(ndvi[valid_images], despike_thresh)[1]
+            segs = sf.seg_fit(despiked, max_segs, seg_thresh, np.array(sorted_dates)[valid_images])
+        except:
+            print("Issue at this row and col.")
+            despiked = np.zeros_like(ndvi)
+            segs = np.zeros_like(ndvi)
+    else:
+        print("Not enough valid data at this row and col.")
+        despiked = np.zeros_like(ndvi)
+        segs = np.zeros_like(ndvi)
+    return despiked, segs
+
+
+def do_all_despike_and_segs(time_series, sorted_dates, despike_thresh, max_segs, seg_thresh, ps_included=True,
+                            verbose=True):
+    # take ndvi_all and keepers_all straight out of build_time_series
+    # ndvi_all (and keepers_all and is_hls_all) come in as a list with 'rows' items, each with 'cols' items
+    print("==============================")
+    print("Despiking and fitting segments")
+    print("==============================")
+    start = time.time()
+    all_pixel_data = []
+    for row in time_series:
+        row_data = []
+        for col in row:
+            ndvi = col[0]
+            keepers = col[1]
+            is_hls = col[2]
+            despike_wo_ps, segs_wo_ps = calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh, max_segs,
+                                                            seg_thresh, is_hls, include_ps=False)
+            if ps_included:
+                despike_w_ps, segs_w_ps = calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh,
+                                                                  max_segs, seg_thresh, is_hls, include_ps=False)
+                row_data.append([despike_wo_ps, segs_wo_ps, despike_w_ps, segs_w_ps])
+            else:
+                row_data.append([despike_wo_ps, segs_wo_ps])
+        if verbose:
+            if row % 10 == 0:
+                print("Despiked and seg-fitted row " + str(row) + "after " + str(int(time.time()-start)) + "secs.")
+        all_pixel_data.append(row_data)
     return all_pixel_data
