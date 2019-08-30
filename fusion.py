@@ -242,7 +242,7 @@ def find_closest_date(image_date, parsed_files):
         date_differences.append([(image_date - parsed_files[ref]["datetime"]).days, ref])  # positive when image_date is later than test date
         # this method means that the preference is to normalize to images earlier in the year
     idx_min = np.argmin([abs(d[0]) for d in date_differences])  # index of the date in list which is closest to image_date
-    date_differences = np.asarray(date_differences)  # TODO: UNTESTED conversion
+    date_differences = np.asarray(date_differences)
     nearest_image = date_differences[idx_min][1]
     return nearest_image
 
