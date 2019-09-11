@@ -367,9 +367,10 @@ def build_time_series(hls_dir, ps_dir=None, start_year=2016, nodata_val=-1000, v
             ndvi = np.where(ndvi > 1.0, -0.0, ndvi)
             del series
             # sort the ndvi series based on dates (remember, dates are originally unordered - L30 then S30)
+            # TODO: figure out if I need to use series_dates or sorted_dates here!!
             ndvi = np.array([x for y, x in sorted(zip(series_dates, ndvi))])
             # sort the HLS identifiers to match the dates
-            is_hls = np.array([x for y, x in sorted(zip(series_dates, is_hls))])
+            is_hls = np.array([x for y, x in sorted(zip(series_dates, is_hls))])  # sorting is_hls based on dates
             # remove dates where the pixel has been masked/saturated
             keepers = []
             for pix in ndvi:
@@ -379,14 +380,14 @@ def build_time_series(hls_dir, ps_dir=None, start_year=2016, nodata_val=-1000, v
                     keepers.append(True)
             keepers = np.array(keepers)
             # add the ndvi series for this position to a list of arrays
-            row_data.append((ndvi, keepers, is_hls))
+            row_data.append((ndvi, keepers))
         all_pixel_data.append(row_data)  # this will store it in rows... is that what we want? or better to 'unzip'?
         if verbose:
             if row % 10 == 0:
                 print("Finished row " + str(row) + " after " + str(int(time.time()-start)) + " seconds. ")
     end = time.time()
     print("Total time elapsed: " + str(int(end-start)) + " seconds.")
-    return all_pixel_data, np.array(sorted_dates)
+    return all_pixel_data, np.array(sorted_dates), is_hls
 
 
 def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_segs=10, seg_thresh=0.05, is_hls=None,
@@ -430,8 +431,20 @@ def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_
     return despiked, segs
 
 
-def do_all_despike_and_segs(time_series, sorted_dates, despike_thresh, max_segs, seg_thresh, ps_included=True,
+def do_all_despike_and_segs(time_series, sorted_dates, despike_thresh, max_segs, seg_thresh, is_hls, ps_included=True,
                             verbose=True):
+    """
+    For every pixel in the time series (output from build_time_series()), fit despike and fit segments.
+    :param time_series: (list) the output from build_time_series()
+    :param sorted_dates: (array) all image dates, arranged chronologically
+    :param despike_thresh:
+    :param max_segs:
+    :param seg_thresh:
+    :param is_hls: (ndarray) boolean array signifying whether each image is from the HLS dataset
+    :param ps_included:
+    :param verbose:
+    :return: (list) despiked_wo_ps, segs_w_ps, [despiked_w_ps, segs_w_ps]
+    """
     # take ndvi_all and keepers_all straight out of build_time_series
     # ndvi_all (and keepers_all and is_hls_all) come in as a list with 'rows' items, each with 'cols' items
     print("==============================")
@@ -444,7 +457,6 @@ def do_all_despike_and_segs(time_series, sorted_dates, despike_thresh, max_segs,
         for j, col in enumerate(row):
             ndvi = col[0]
             keepers = col[1]
-            is_hls = col[2]
             # if there are no ps images, then is_hls should just be an array where every value is True
             despike_wo_ps, segs_wo_ps = calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh, max_segs,
                                                               seg_thresh, is_hls, include_ps=False,
@@ -461,3 +473,46 @@ def do_all_despike_and_segs(time_series, sorted_dates, despike_thresh, max_segs,
                 print("Despiked and seg-fitted row " + str(i) + " after " + str(int(time.time()-start)) + " secs.")
         all_pixel_data.append(row_data)
     return all_pixel_data
+
+
+def calculate_indices(filepath, outdir=None):
+    """
+    Generates a 5-band image containing 5 different vegetation indices. In order: NDVI, NGRVI, ARVI, VARIG, GLI_b
+    :param filepath: (string) path to input image
+    :param outdir: (string) path to output directory. If none, the input directory will be used.
+    :return:
+    """
+    if not outdir:
+        outdir = os.path.split(filepath)[0]
+    with rasterio.open(filepath, 'r') as src:
+        # get the import meta info
+        msk = src.dataset_mask()
+        meta = src.profile
+        # read bands
+        blue = src.read(1)
+        green = src.read(2)
+        red = src.read(3)
+        nir = src.read(4)
+        # multiply by masks to remove any nodata values
+        # also mask any values less than -1.0 or greater than +1.0
+        ndvi = ma.masked_outside(((nir - red) / (nir + red)) * msk / 255., -1.0, 1.0)
+        ngrvi = ma.masked_outside(((green - red) / (green + red)) * msk / 255., -1.0, 1.0)
+        arvi = ma.masked_outside(((nir - 2 * red + blue) / (nir + blue)) * msk / 255., -1.0, 1.0)
+        varig = ma.masked_outside(((green - red) / (green + red - blue)) * msk / 255., -1.0, 1.0)
+        gli_b = ma.masked_outside((((blue - red) + (blue - green)) / ((2 * blue) + (red + green))) * msk / 255., -1.0,
+                                  1.0)
+    # create new filename
+    filepath_out = os.path.join(outdir, os.path.split(filepath)[1][:-4] + "_VIs.tif")
+    # update the meta
+    meta['count'] = 5
+    meta['dtype'] = 'float32'
+    # save image
+    with rasterio.open(filepath_out, 'w', **meta) as dst:
+        new_msk = msk * (~ndvi.mask | ~ngrvi.mask | ~arvi.mask | ~varig.mask | ~gli_b.mask)
+        dst.write_mask(new_msk)
+        dst.write(ma.asarray(ndvi, dtype='float32'), 1)
+        dst.write(ma.asarray(ngrvi, dtype='float32'), 2)
+        dst.write(ma.asarray(arvi, dtype='float32'), 3)
+        dst.write(ma.asarray(varig, dtype='float32'), 4)
+        dst.write(ma.asarray(gli_b, dtype='float32'), 5)
+    return filepath_out
