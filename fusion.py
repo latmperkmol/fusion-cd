@@ -125,16 +125,55 @@ def make_shapefile_from_raster(raster, outname="vectorized.shp", outdir=None):
     d['val'] = []
     geometry = []
     with rasterio.open(raster, 'r') as src:
-        empty = np.zeros_like(src.read(1))
-        for shp, val in rasterio.features.shapes(source=empty, transform=src.transform):
-            d['val'].append(val)
-            geometry.append(shape(shp))
+        msk = src.dataset_mask()  # load in the mask (data==255, no-data==0)
+        for shp, val in rasterio.features.shapes(source=msk, transform=src.transform):  # use mask for geometry
+            if val == 255:  # value of unmasked areas
+                d['val'].append(val)
+                geometry.append(shape(shp))
         raster_crs = src.crs
     df = pd.DataFrame(data=d)
     geo_df = GeoDataFrame(df, crs={'init': raster_crs['init']}, geometry=geometry)
     geo_df['area'] = geo_df.area
     geo_df.to_file(outpath, driver="ESRI Shapefile")
-    return
+    return outpath
+
+
+def make_intersection_poly(img1_path, img2_path, outname="intersect_poly.shp", outdir=None):
+    """
+
+    :param img1_path: raster
+    :param img2_path: raster
+    :param outname:
+    :param outdir:
+    :return:
+    """
+    img1_shapefile = make_shapefile_from_raster(img1_path, os.path.split(img1_path)[1][:-4]+".shp")
+    img2_shapefile = make_shapefile_from_raster(img2_path, os.path.split(img2_path)[1][:-4]+".shp")
+
+    polygon1 = [shape(feature['geometry']) for feature in fiona.open(img1_shapefile)][0]
+    polygon2 = [shape(feature['geometry']) for feature in fiona.open(img2_shapefile)][0]
+    intersect_poly = polygon1.intersection(polygon2)
+    d = dict()
+    d['val'] = [255]  # the fill value for data in rasterio masks
+    geometry = [intersect_poly]
+    # might end up with geometry[0] being a Geometry Collection.
+    # If that's the case, go through it and delete all non-polygons
+    g = None
+    try:
+        for g in geometry[0]:  # loop through the geometry collection, if that's what it is
+            if g.geom_type != "Polygon":  # delete anything that isn't a polygon
+                del g
+        geometry[0] = g  # grab the first remaining item from the geometry collection, set that to geometry[0]
+    except TypeError:  # if it's not a geometry collection, pass
+        pass
+    with rasterio.open(img1_path, 'r') as src:
+        raster_crs = src.crs
+    df = pd.DataFrame(data=d)
+    geo_df = GeoDataFrame(df, crs={"init": raster_crs["init"]}, geometry=geometry)
+    geo_df["area"] = geo_df.area
+    intersect_out = os.path.join(outdir, outname)
+    geo_df.to_file(intersect_out, driver="ESRI Shapefile")
+    return intersect_out
 
 
 def get_ncp(mad_img, save_image=False, out_path=None):
@@ -367,7 +406,6 @@ def build_time_series(hls_dir, ps_dir=None, start_year=2016, nodata_val=-1000, v
             ndvi = np.where(ndvi > 1.0, -0.0, ndvi)
             del series
             # sort the ndvi series based on dates (remember, dates are originally unordered - L30 then S30)
-            # TODO: figure out if I need to use series_dates or sorted_dates here!!
             ndvi = np.array([x for y, x in sorted(zip(series_dates, ndvi))])
             # sort the HLS identifiers to match the dates
             is_hls = np.array([x for y, x in sorted(zip(series_dates, is_hls))])  # sorting is_hls based on dates
@@ -420,7 +458,7 @@ def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_
         try:
             despiked = despike(ndvi[valid_images], despike_thresh)[1]
             segs = sf.seg_fit(despiked, max_segs, seg_thresh, np.array(sorted_dates)[valid_images])
-        except:
+        except:  # TODO: fix this naked except since it makes it difficult to kill the kernel when running
             print("Issue at row " + str(row_num) + " and column " + str(col_num))
             despiked = np.zeros_like(ndvi)
             segs = np.zeros_like(ndvi)
@@ -489,10 +527,10 @@ def calculate_indices(filepath, outdir=None):
         msk = src.dataset_mask()
         meta = src.profile
         # read bands
-        blue = src.read(1)
-        green = src.read(2)
-        red = src.read(3)
-        nir = src.read(4)
+        blue = np.array(src.read(1), dtype='float32')
+        green = np.array(src.read(2), dtype='float32')
+        red = np.array(src.read(3), dtype='float32')
+        nir = np.array(src.read(4), dtype='float32')
         # multiply by masks to remove any nodata values
         # also mask any values less than -1.0 or greater than +1.0
         ndvi = ma.masked_outside(((nir - red) / (nir + red)) * msk / 255., -1.0, 1.0)
@@ -516,3 +554,38 @@ def calculate_indices(filepath, outdir=None):
         dst.write(ma.asarray(varig, dtype='float32'), 4)
         dst.write(ma.asarray(gli_b, dtype='float32'), 5)
     return filepath_out
+
+
+def breakpoint_extraction(segs, dates, return_slopes=False):
+    """
+    Takes in one segs array and the corresponding dates. Approximates the slope at each point. Uses slope to look for
+    breakpoints in the segments.
+    Returns the dates of all breakpoints. If there are no breakpoints, returns a length-1 array with 0.
+    If the length of segs array is less than 3, returns same result as no breakpoints.
+    :param segs: (np array) output from segment fitter
+    :param dates: need to use the dates corresponding to each point in segs. i.e. not the fully sorted_dates array
+    :return:
+    """
+    if len(segs >= 3):
+        slope = (segs[1:]-segs[:-1])/(dates[1:]-dates[:-1])
+        derivative = slope[1:]-slope[:-1]  # approximate the slope
+        # make an array where dates representing breakpoints are marked as True and all other points are marked as False
+        # same length as segs array
+        breakpoints = abs(derivative) > 1e-10  # if derivative of segs is significantly greater than 0, then mark change
+        breakpoints = np.insert(breakpoints, 0, False)  # buffer with a False value at the beginning
+        breakpoints = np.append(breakpoints, False)  # Buffer with a False value at the end too
+        if dates[breakpoints] > 0:
+            if return_slopes:  # return the slope at each point if requested. Otherwise, only return breakpoint dates
+                return dates[breakpoints], slope  # if there are breakpoints, return them in an array
+            else:
+                return dates[breakpoints]
+        else:  # if no breakpoints
+            if return_slopes:
+                return np.array([0]), np.array([0])  # return array with 0 for both breakpoints and slope
+            else:
+                return np.array([0])
+    else:
+        if return_slopes:
+            return np.array([0]), np.array([0])  # return two of these if slopes were requested but unavailable
+        else:
+            return np.array([0])
