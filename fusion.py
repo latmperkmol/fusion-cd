@@ -23,6 +23,7 @@ import gdal
 import osr
 from osgeo.gdalconst import GDT_UInt16
 import time
+import multiprocessing as mp
 # weird and janky, but works until these libraries are combined
 try:
     from despike import despike
@@ -102,7 +103,7 @@ def clip_to_shapefile(raster, shapefile, outname="clipped_raster.tif", outdir=No
     # save to outpath
     with rasterio.open(outpath, 'w', **out_meta) as dst:
         dst.write(out_image)
-    return
+    return outpath
 
 
 def make_shapefile_from_raster(raster, outname="vectorized.shp", outdir=None):
@@ -147,6 +148,8 @@ def make_intersection_poly(img1_path, img2_path, outname="intersect_poly.shp", o
     :param outdir:
     :return:
     """
+    if not outdir:
+        outdir = os.path.split(img1_path)[0]
     img1_shapefile = make_shapefile_from_raster(img1_path, os.path.split(img1_path)[1][:-4]+".shp")
     img2_shapefile = make_shapefile_from_raster(img2_path, os.path.split(img2_path)[1][:-4]+".shp")
 
@@ -176,37 +179,58 @@ def make_intersection_poly(img1_path, img2_path, outname="intersect_poly.shp", o
     return intersect_out
 
 
-def get_ncp(mad_img, save_image=False, out_path=None):
+def get_ncp(mad_img, change_method="chi2", thresh=100, save_image=False, outname="ncp_img.tif", out_path=None):
     """
     Calculate the no-change probability of each pixel in an input MAD image.
+    Assumes that the sum of the squared standardized MAD variates follows a chi-squared distribution.
+    May not be a good assumption.
     :param mad_img: (string) path to the MAD image
+    :param change_method: (str) change detection method. Default to chi2.
+        chi2: uses a chi-squared test, assuming a chi2 distribution with (bands-1) degrees of freedom
+        threshold: if chosen, the output will be change/no-change rather than a probability. thresh is min for change.
+    :param thresh: (numeric) if change_method=="threshold", use this value as minimum band value for change
     :param save_image: (bool) whether or not to save the NCP values as a single band GeoTiff
-    :param out_path: (string) output destination of the NCP image
+    :param outname: (str) filename of the NCP image
+    :param out_path: (str) output destination of the NCP image
     :return:
     """
-    from scipy.stats import chi2
     # read in the MAD image's chisquared band (last band) and ravel it
     with rasterio.open(mad_img, 'r') as src:
         # get info about the image (rows, cols, bands)
         profile = src.meta
         bands = profile["count"]
-        chisqr = src.read(bands)
-
-    # generate no-change probability for each pixel (location on normalized chi2 cdf - basically alpha value)
+        chisqr = src.read(bands)  # even if not using chi2 method, use this name to refer to sum of sqrd MAD variates
     chisqr_flat = chisqr.ravel()
-    ncp = 1 - chi2.cdf(chisqr_flat, bands-1)
-    # ncp = no-change probability, so low number means low prob of being unchanged. i.e. high numbers are invariant
-    ncp_reshape = np.reshape(ncp, np.shape(chisqr))
-    # if requested, save a new image with the ncp for each image
+
+    ncp_reshape = None
+    running = True  # force user to choose a valid change_method
+    while running:
+        if change_method == "chi2":
+            running = False  # finish while loop if change_method is chi2
+            from scipy.stats import chi2
+            # generate no-change probability for each pixel (location on normalized chi2 cdf - basically alpha value)
+            ncp = 1 - chi2.cdf(chisqr_flat, bands-1)
+            # ncp = no-change probability, so low number means low prob of being unchanged.
+            # i.e. high numbers are invariant
+            ncp_reshape = np.reshape(ncp, np.shape(chisqr))
+            # if requested, save a new image with the ncp for each image
+        elif change_method == "threshold":
+            running = False
+            changed_pix = chisqr_flat > thresh  # if a pixel exceeds thresh, mark as changed (True)
+            ncp_reshape = np.reshape(changed_pix, np.shape(chisqr))
+        else:
+            change_method = input("Invalid change method. Options are 'chi2' and 'threshold': ")
+
     if save_image:
         # if path is not specified, give it a silly name and save it with the input MAD image
         if not out_path:
             out_dir = os.path.split(mad_img)[0]
-            out_path = os.path.join(out_dir, "ncp_img.tif")
+            out_path = os.path.join(out_dir, outname)
         profile["count"] = 1
         with rasterio.open(out_path, 'w', **profile) as dst:
             dst.write(ncp_reshape)
-    return ncp_reshape
+
+    return ncp_reshape  # return the reshaped array
 
 
 def parse_hls_filepath(filepath):
@@ -429,7 +453,7 @@ def build_time_series(hls_dir, ps_dir=None, start_year=2016, nodata_val=-1000, v
 
 
 def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_segs=10, seg_thresh=0.05, is_hls=None,
-                          include_ps=True, row_num=None, col_num=None):
+                          include_ps=True, row_num=None, col_num=None, verbose=True):
     """
     Given a time series for a single (pixel) location, calculate the despiked values and segment values.
     Requires the dates associated with each image and a boolean array stating which values to keep (True) and to ignore.
@@ -442,6 +466,9 @@ def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_
     :param seg_thresh:
     :param is_hls:
     :param include_ps:
+    :param row_num: (int) current row for printing updates. only relevant if verbose=True
+    :param col_num: (int) current column for printing updates. only relevant if verbose=True
+    :param verbose: (bool) print some updates about rows/cols that are having issues or completing
     :return:
     """
     # note that this is writing out lists instead of tuples. which is better??
@@ -458,12 +485,14 @@ def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_
         try:
             despiked = despike(ndvi[valid_images], despike_thresh)[1]
             segs = sf.seg_fit(despiked, max_segs, seg_thresh, np.array(sorted_dates)[valid_images])
-        except:  # TODO: fix this naked except since it makes it difficult to kill the kernel when running
-            print("Issue at row " + str(row_num) + " and column " + str(col_num))
+        except (IndexError, ValueError, ZeroDivisionError):
+            if verbose:
+                print("Issue at row " + str(row_num) + " and column " + str(col_num))
             despiked = np.zeros_like(ndvi)
             segs = np.zeros_like(ndvi)
     else:
-        print("Not enough valid data at row " + str(row_num) + " and column " + str(col_num))
+        if verbose and (col_num != 0):
+            print("Not enough valid data at row " + str(row_num) + " and column " + str(col_num))
         despiked = np.zeros_like(ndvi)
         segs = np.zeros_like(ndvi)
     return despiked, segs
@@ -513,6 +542,86 @@ def do_all_despike_and_segs(time_series, sorted_dates, despike_thresh, max_segs,
     return all_pixel_data
 
 
+# function that will actually apply the calculation to each chunk
+def process_chunk(chunk, c_index, sorted_dates, despike_thresh, max_segs, seg_thresh, is_hls, ps_included=True):
+    # c_index is used for tracking which portion of the image this chunk belongs to [0 to n_proc]
+    chunk_out = []
+    for pix in chunk:  # still looping instead of fully vectorizing, but at least now its in parallel
+        ndvi = pix[0]
+        keepers = pix[1].astype('bool')
+        despike_wo_ps, segs_wo_ps = calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh, max_segs,
+                                                          seg_thresh, is_hls, include_ps=False, verbose=False)
+        if ps_included:
+            despike_w_ps, segs_w_ps = calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh, max_segs,
+                                                            seg_thresh, is_hls, include_ps=True, verbose=False)
+            chunk_out.append([despike_wo_ps, segs_wo_ps, despike_w_ps, segs_w_ps])
+        else:
+            chunk_out.append([despike_wo_ps, segs_wo_ps])
+    return [chunk_out, c_index]
+
+
+# TODO: figure out if this can be run safely from within a function, or if it needs to be within a '__main__' protocol
+def do_all_despike_and_segs_mp(time_series, sorted_dates, despike_thresh, max_segs, seg_thresh, is_hls,
+                               ps_included=True, n_proc=None):
+    """
+    For every pixel in the time series (output from build_time_series()), fit despike and fit segments.
+    :param time_series: (list) the output from build_time_series()
+    :param sorted_dates: (array) all image dates, arranged chronologically
+    :param despike_thresh:
+    :param max_segs:
+    :param seg_thresh:
+    :param is_hls: (ndarray) boolean array signifying whether each image is from the HLS dataset
+    :param ps_included:
+    :return:
+    """
+    # take ndvi_all and keepers_all straight out of build_time_series
+    # ndvi_all (and keepers_all and is_hls_all) come in as a list with 'rows' items, each with 'cols' items
+
+    # flatten the time series so we just have pixels instead of rows/cols.
+    # len(time_series) is the number of rows (e.g. 1466)
+    # each item is the number of columns (e.g. 1958)
+    time_series = np.array(time_series)  # (rows, cols, ndvi/keepers, dates).
+    rows, cols, two, dates = time_series.shape # Unpack to (pixels, ndvi/keepers, dates).
+    time_series = time_series.reshape((rows*cols, two, dates))  # put things in a nice flattened array for now
+    # set up the multiprocessing framework
+    if not n_proc:  # default value
+        n_proc = int(mp.cpu_count() / 2)  # number of processes. use half our cores
+    chunksize = int(time_series.shape[0] / n_proc)  # size of each chunk to send to each CPU
+    # lay out the chunks that we send off for processing
+    proc_chunks = []
+    for i_proc in range(n_proc):
+        chunk_start = i_proc * chunksize
+        # include the remainder for the last process since the pixels probably don't divide into the cores evenly
+        chunk_end = (i_proc + 1) * chunksize if i_proc < n_proc - 1 else None
+        proc_chunks.append(time_series[chunk_start:chunk_end, :, :])  # NOT a deep copy - just points to the array
+    assert sum(map(len, proc_chunks)) == rows*cols  # make sure we got all the data into proc_chunks
+    # need to define a function that processes a chunk. somehow need to track the index of each output so that the
+    # partial results can be combined from the individual processes later
+
+    print("==============================")
+    print("Despiking and fitting segments")
+    print("==============================")
+    start = time.time()
+    with mp.Pool(processes=n_proc) as pool:
+        # each proc_results item (probably) is (data, index)
+        proc_results = [pool.apply_async(process_chunk, args=(chunk, c_index))
+                        for c_index, chunk in enumerate(proc_chunks)]
+        result_chunks = [result.get() for result in proc_results]
+    # sort the results based on the index
+    results = []
+    # I think this loop will order them?? Could probably do some zip/unzip to do this instead
+    for index in range(n_proc):
+        for result in result_chunks:
+            if result[1] == index:
+                results.append(result[0])
+    # so now results is one big list, presumably with the following 'dimensions': (rows*cols, 4, dates).
+    # convert from list to array with correct dimensions
+    final_results = np.reshape(results, (rows, cols, 4, dates))
+    end = time.time()
+    print("Total time: " + str((end-start)/3600) + " hours")
+    return final_results
+
+
 def calculate_indices(filepath, outdir=None):
     """
     Generates a 5-band image containing 5 different vegetation indices. In order: NDVI, NGRVI, ARVI, VARIG, GLI_b
@@ -537,8 +646,7 @@ def calculate_indices(filepath, outdir=None):
         ngrvi = ma.masked_outside(((green - red) / (green + red)) * msk / 255., -1.0, 1.0)
         arvi = ma.masked_outside(((nir - 2 * red + blue) / (nir + blue)) * msk / 255., -1.0, 1.0)
         varig = ma.masked_outside(((green - red) / (green + red - blue)) * msk / 255., -1.0, 1.0)
-        gli_b = ma.masked_outside((((blue - red) + (blue - green)) / ((2 * blue) + (red + green))) * msk / 255., -1.0,
-                                  1.0)
+        gli_b = ma.masked_outside(((2*blue - red - green) / (2*blue + red + green)) * msk / 255., -1.0, 1.0)
     # create new filename
     filepath_out = os.path.join(outdir, os.path.split(filepath)[1][:-4] + "_VIs.tif")
     # update the meta
@@ -564,6 +672,7 @@ def breakpoint_extraction(segs, dates, return_slopes=False):
     If the length of segs array is less than 3, returns same result as no breakpoints.
     :param segs: (np array) output from segment fitter
     :param dates: need to use the dates corresponding to each point in segs. i.e. not the fully sorted_dates array
+    :param return_slopes: (bool) if True, return the approximate slope at each point in addition to the breakpoints
     :return:
     """
     if len(segs >= 3):
@@ -589,3 +698,73 @@ def breakpoint_extraction(segs, dates, return_slopes=False):
             return np.array([0]), np.array([0])  # return two of these if slopes were requested but unavailable
         else:
             return np.array([0])
+
+
+def delta_vis(vi_img1, vi_img2, outname="vi_delta.tif", outdir=None):
+    """
+    Take the difference between two images in their area of overlap. Save the delta image to disk.
+    Designed with vegetation indices in mind, but should work fine with other images as well.
+    :param vi_img1: (str) filepath to VI image 1. MUST BE THE EARLIER DATE.
+    :param vi_img2: (str) filepath to VI image 2. MUST BE THE LATER DATE.
+    :param outname:
+    :param outdir:
+    :return:
+    """
+    if not outdir:
+        outdir = os.path.split(vi_img1)[0]
+    # make shapefile of the intersection and clip both images to the area of intersection
+    intersection_poly = make_intersection_poly(vi_img1, vi_img2, outname="vi_intersection.shp", outdir=outdir)
+    # TODO: do we really need to save these to the disk? Should probably just load them into memory to save write time.
+    clipped_date1 = clip_to_shapefile(vi_img1, intersection_poly, outname="vi_date1_clipped.tif", outdir=outdir)
+    clipped_date2 = clip_to_shapefile(vi_img2, intersection_poly, outname="vi_date2_clipped.tif", outdir=outdir)
+    # load in the clipped images to calculate delta
+    with rasterio.open(clipped_date1, 'r') as src:
+        data1 = src.read()
+        meta1 = src.meta
+    with rasterio.open(clipped_date2, 'r') as src:
+        data2 = src.read()
+        meta2 = src.meta
+    delta = data2 - data1  # difference the VIs. Positive means increase in VIs. Negative means decrease.
+
+    # write the results out
+    outpath = os.path.join(outdir, outname)
+    with rasterio.open(outpath, 'w', **meta1) as dst:
+        dst.write(delta)
+
+    return outpath
+
+
+def change_from_vis_and_mad(vi_path1, vi_path2, mad_img_path, thresh=75, votes=2, outname="change.tif", outdir=None):
+    """
+    Areas that experienced change are 1. Elsewhere is 0. I think. Man my brain is tired.
+    :param vi_path1: str) filepath to VI image 1. MUST BE THE EARLIER DATE.
+    :param vi_path2: (str) filepath to VI image 2. MUST BE THE LATER DATE.
+    :param mad_img_path:
+    :param thresh:
+    :param votes:
+    :param outname:
+    :param outdir:
+    :return:
+    """
+    if not outdir:
+        outdir = os.path.split(mad_img_path)[0]
+    delta_vi_path = delta_vis(vi_path1, vi_path2, outdir=outdir)
+    mad_change_arr = get_ncp(mad_img_path, change_method="threshold", thresh=thresh, save_image=False)
+
+    with rasterio.open(delta_vi_path, 'r') as src:  # read the delta_vi image created at the top of the function
+        delta_vi_arr = src.read()
+        meta_out = src.meta
+
+    vi_change = np.array(delta_vi_arr < 0, dtype='uint8')  # anywhere that the VI has decreased is True
+    # need to collect "votes" from the vegetation indices
+    vi_change_votes = np.sum(vi_change, axis=0)
+    # only count change where number of decreased VIs >= votes
+    combined_change = mad_change_arr * (vi_change_votes >= votes)
+
+    # save image
+    meta_out['count'] = 1  # binary change
+    meta_out['dtype'] = 'uint16'  # smallest datatype that we can write to geotiff... I think
+    combined_change = combined_change.astype('uint16')
+    with rasterio.open(os.path.join(outdir, outname), 'w', **meta_out) as dst:
+        dst.write_band(1, combined_change)
+    return os.path.join(outdir, outname)
