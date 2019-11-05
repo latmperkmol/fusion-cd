@@ -24,6 +24,12 @@ import osr
 from osgeo.gdalconst import GDT_UInt16
 import time
 import multiprocessing as mp
+import scipy.ndimage
+import geojson
+import json
+import geopandas as gpd
+from shapely.geometry import Polygon
+from shapely.geometry import LinearRing
 # weird and janky, but works until these libraries are combined
 try:
     from despike import despike
@@ -387,6 +393,7 @@ def build_time_series(hls_dir, ps_dir=None, start_year=2016, nodata_val=-1000, v
             is_hls.append(False)  # identify these dates as not HLS
         series_dates = series_dates + ps_dates
     sorted_dates = sorted(series_dates)  # want a sorted version since the dates may initially be grouped by sensor
+    is_hls = np.array([x for y, x in sorted(zip(series_dates, is_hls))])  # sorting is_hls based on dates
 
     # load in all the HLS arrays
     hls_arrays = []
@@ -432,7 +439,6 @@ def build_time_series(hls_dir, ps_dir=None, start_year=2016, nodata_val=-1000, v
             # sort the ndvi series based on dates (remember, dates are originally unordered - L30 then S30)
             ndvi = np.array([x for y, x in sorted(zip(series_dates, ndvi))])
             # sort the HLS identifiers to match the dates
-            is_hls = np.array([x for y, x in sorted(zip(series_dates, is_hls))])  # sorting is_hls based on dates
             # remove dates where the pixel has been masked/saturated
             keepers = []
             for pix in ndvi:
@@ -459,12 +465,12 @@ def calc_despike_and_segs(ndvi, keepers, sorted_dates, despike_thresh=0.05, max_
     Requires the dates associated with each image and a boolean array stating which values to keep (True) and to ignore.
     If the input values come from a mix of HLS and PS, this can also use only the HLS values.
     :param ndvi:
-    :param keepers:
+    :param keepers: (nparray bool)
     :param sorted_dates:
     :param despike_thresh:
     :param max_segs:
     :param seg_thresh:
-    :param is_hls:
+    :param is_hls: (nparray bool)
     :param include_ps:
     :param row_num: (int) current row for printing updates. only relevant if verbose=True
     :param col_num: (int) current column for printing updates. only relevant if verbose=True
@@ -544,6 +550,18 @@ def do_all_despike_and_segs(time_series, sorted_dates, despike_thresh, max_segs,
 
 # function that will actually apply the calculation to each chunk
 def process_chunk(chunk, c_index, sorted_dates, despike_thresh, max_segs, seg_thresh, is_hls, ps_included=True):
+    """
+
+    :param chunk: (nparray) pixels to be processed with dimensions (num_pixels, 2, num_dates)
+    :param c_index: (int) index to track which chunk is being processed. Needed to reassemble components correctly.
+    :param sorted_dates: (arr)
+    :param despike_thresh: (float)
+    :param max_segs: (float)
+    :param seg_thresh: (float)
+    :param is_hls: (arr, bool)
+    :param ps_included: (bool)
+    :return:
+    """
     # c_index is used for tracking which portion of the image this chunk belongs to [0 to n_proc]
     chunk_out = []
     for pix in chunk:  # still looping instead of fully vectorizing, but at least now its in parallel
@@ -557,6 +575,7 @@ def process_chunk(chunk, c_index, sorted_dates, despike_thresh, max_segs, seg_th
             chunk_out.append([despike_wo_ps, segs_wo_ps, despike_w_ps, segs_w_ps])
         else:
             chunk_out.append([despike_wo_ps, segs_wo_ps])
+    print("Finished chunk " + str(c_index))
     return [chunk_out, c_index]
 
 
@@ -565,13 +584,15 @@ def do_all_despike_and_segs_mp(time_series, sorted_dates, despike_thresh, max_se
                                ps_included=True, n_proc=None):
     """
     For every pixel in the time series (output from build_time_series()), fit despike and fit segments.
-    :param time_series: (list) the output from build_time_series()
-    :param sorted_dates: (array) all image dates, arranged chronologically
+    Fancy multiprocessing version.
+    :param time_series:
+    :param sorted_dates:
     :param despike_thresh:
     :param max_segs:
     :param seg_thresh:
-    :param is_hls: (ndarray) boolean array signifying whether each image is from the HLS dataset
+    :param is_hls:
     :param ps_included:
+    :param n_proc:
     :return:
     """
     # take ndvi_all and keepers_all straight out of build_time_series
@@ -604,7 +625,8 @@ def do_all_despike_and_segs_mp(time_series, sorted_dates, despike_thresh, max_se
     start = time.time()
     with mp.Pool(processes=n_proc) as pool:
         # each proc_results item (probably) is (data, index)
-        proc_results = [pool.apply_async(process_chunk, args=(chunk, c_index))
+        proc_results = [pool.apply_async(process_chunk, args=(chunk, c_index, sorted_dates, despike_thresh, max_segs,
+                                                              seg_thresh, is_hls))
                         for c_index, chunk in enumerate(proc_chunks)]
         result_chunks = [result.get() for result in proc_results]
     # sort the results based on the index
@@ -616,7 +638,8 @@ def do_all_despike_and_segs_mp(time_series, sorted_dates, despike_thresh, max_se
                 results.append(result[0])
     # so now results is one big list, presumably with the following 'dimensions': (rows*cols, 4, dates).
     # convert from list to array with correct dimensions
-    final_results = np.reshape(results, (rows, cols, 4, dates))
+    final_results = np.array(results)
+    final_results = np.reshape(final_results, (rows, cols, 4, dates))
     end = time.time()
     print("Total time: " + str((end-start)/3600) + " hours")
     return final_results
@@ -646,7 +669,8 @@ def calculate_indices(filepath, outdir=None):
         ngrvi = ma.masked_outside(((green - red) / (green + red)) * msk / 255., -1.0, 1.0)
         arvi = ma.masked_outside(((nir - 2 * red + blue) / (nir + blue)) * msk / 255., -1.0, 1.0)
         varig = ma.masked_outside(((green - red) / (green + red - blue)) * msk / 255., -1.0, 1.0)
-        gli_b = ma.masked_outside(((2*blue - red - green) / (2*blue + red + green)) * msk / 255., -1.0, 1.0)
+        # actually makes more sense to invert the version of this index that was used by Goodbody et al 2018
+        gli_b = ma.masked_outside((-1.0*(2*blue - red - green) / (2*blue + red + green)) * msk / 255., -1.0, 1.0)
     # create new filename
     filepath_out = os.path.join(outdir, os.path.split(filepath)[1][:-4] + "_VIs.tif")
     # update the meta
@@ -671,19 +695,28 @@ def breakpoint_extraction(segs, dates, return_slopes=False):
     Returns the dates of all breakpoints. If there are no breakpoints, returns a length-1 array with 0.
     If the length of segs array is less than 3, returns same result as no breakpoints.
     :param segs: (np array) output from segment fitter
-    :param dates: need to use the dates corresponding to each point in segs. i.e. not the fully sorted_dates array
+    :param dates: (np array) dates corresponding to each point in segs.
     :param return_slopes: (bool) if True, return the approximate slope at each point in addition to the breakpoints
     :return:
     """
-    if len(segs >= 3):
+    if len(segs >= 3) and (np.sum(segs) > 0):
         slope = (segs[1:]-segs[:-1])/(dates[1:]-dates[:-1])
+        # add correction for when delta_segs == 0 and delta_dates == 0
+        fail_count = 0
+        while np.isnan(slope).any() and (fail_count < 3):
+            fail_count += 1
+            try:
+                slope = np.where(~np.isnan(slope), slope, np.insert(slope[1:], -1, 0))  # use value from one point earlier
+            except IndexError:
+                # if that throws an index error, just go back and use the regular slope with nans.
+                pass
         derivative = slope[1:]-slope[:-1]  # approximate the slope
         # make an array where dates representing breakpoints are marked as True and all other points are marked as False
         # same length as segs array
         breakpoints = abs(derivative) > 1e-10  # if derivative of segs is significantly greater than 0, then mark change
         breakpoints = np.insert(breakpoints, 0, False)  # buffer with a False value at the beginning
         breakpoints = np.append(breakpoints, False)  # Buffer with a False value at the end too
-        if dates[breakpoints] > 0:
+        if len(dates[breakpoints]) > 0:  # if there are any dates that are breakpoints...
             if return_slopes:  # return the slope at each point if requested. Otherwise, only return breakpoint dates
                 return dates[breakpoints], slope  # if there are breakpoints, return them in an array
             else:
@@ -734,14 +767,16 @@ def delta_vis(vi_img1, vi_img2, outname="vi_delta.tif", outdir=None):
     return outpath
 
 
-def change_from_vis_and_mad(vi_path1, vi_path2, mad_img_path, thresh=75, votes=2, outname="change.tif", outdir=None):
+def change_from_vis_and_mad(vi_path1, vi_path2, mad_img_path, thresh=75, votes=3,
+                            decrease_thresh=0, outname="change.tif", outdir=None):
     """
-    Areas that experienced change are 1. Elsewhere is 0. I think. Man my brain is tired.
+    Areas that experienced change are 1. Elsewhere is 0.
     :param vi_path1: str) filepath to VI image 1. MUST BE THE EARLIER DATE.
     :param vi_path2: (str) filepath to VI image 2. MUST BE THE LATER DATE.
     :param mad_img_path:
     :param thresh:
     :param votes:
+    :param decrease_thresh:
     :param outname:
     :param outdir:
     :return:
@@ -753,9 +788,11 @@ def change_from_vis_and_mad(vi_path1, vi_path2, mad_img_path, thresh=75, votes=2
 
     with rasterio.open(delta_vi_path, 'r') as src:  # read the delta_vi image created at the top of the function
         delta_vi_arr = src.read()
+        # flip GLI_b (band 5) so that positive is associated with higher vegetative health
+        delta_vi_arr[-1, :, :] = delta_vi_arr[-1, :, :] * -1.0
         meta_out = src.meta
 
-    vi_change = np.array(delta_vi_arr < 0, dtype='uint8')  # anywhere that the VI has decreased is True
+    vi_change = np.array(delta_vi_arr < decrease_thresh, dtype='uint8')  # anywhere that the VI has decreased is True
     # need to collect "votes" from the vegetation indices
     vi_change_votes = np.sum(vi_change, axis=0)
     # only count change where number of decreased VIs >= votes
@@ -767,4 +804,250 @@ def change_from_vis_and_mad(vi_path1, vi_path2, mad_img_path, thresh=75, votes=2
     combined_change = combined_change.astype('uint16')
     with rasterio.open(os.path.join(outdir, outname), 'w', **meta_out) as dst:
         dst.write_band(1, combined_change)
+    return os.path.join(outdir, outname)
+
+
+def combine_change_images(temporal_path, spatial_path, outname, outdir=None, include_ps=True):
+    """
+    Combine change images from breakpoint temporal method with PS-to-PS normalization
+    :param temporal_path: (str) path
+    :param spatial_path: (str) path
+    :param outname:
+    :param outdir:
+    :param include_ps: (bool) if True, use the HLS+PS from the temporal info. If False, use only the HLS data.
+    :return:
+    """
+    if not outdir:
+        outdir = os.path.split(temporal_path)[0]
+    with rasterio.open(temporal_path, 'r') as src:
+        temporal_meta = src.profile
+        if include_ps:
+            temporal_arr = src.read(2)  # this is the HLS + PS band!
+        else:
+            temporal_arr = src.read(1)  # this is the HLS only band!
+    with rasterio.open(spatial_path, 'r') as src:
+        spatial_meta = src.profile
+        spatial_arr = src.read(1)
+    dst_res = min(spatial_meta['transform'][0], temporal_meta['transform'][0])
+    print("target resolution: " + str(dst_res))
+
+    # figure out the maximum extent (largest of top and right(left?), smallest of bottom and left(right?))
+    dst_left = min(spatial_meta['transform'][2], temporal_meta['transform'][2])
+    dst_top = max(spatial_meta['transform'][5], temporal_meta['transform'][5])
+
+    right_s = spatial_meta['transform'][2] + spatial_meta['width'] * spatial_meta['transform'][0]
+    right_t = temporal_meta['transform'][2] + temporal_meta['width'] * temporal_meta['transform'][0]
+    bottom_s = spatial_meta['transform'][5] - spatial_meta['height'] * spatial_meta['transform'][0]
+    bottom_t = temporal_meta['transform'][5] - temporal_meta['height'] * temporal_meta['transform'][0]
+    dst_right = max(right_s, right_t)
+    dst_bottom = min(bottom_s, bottom_t)
+
+    dst_transform = affine.Affine(dst_res, 0.0, dst_left, 0.0, -1. * dst_res, dst_top)
+
+    # next, need to finish building the metadata
+    dst_width = int((dst_right - dst_left) / dst_res)
+    dst_height = int(-1 * (dst_bottom - dst_top) / dst_res)
+    print("dst width: " + str(dst_width))
+    print("dst height: " + str(dst_height))
+
+    dst_meta = spatial_meta.copy()
+    dst_meta['width'] = dst_width
+    dst_meta['height'] = dst_height
+    dst_meta['transform'] = dst_transform
+
+    # now that we have the transform and metadata built, need to resample the images using rasterio.reproject
+
+    # building empty raster to store them in
+    spatial_resampled = np.zeros((dst_height, dst_width), dtype=dst_meta['dtype'])
+    temporal_resampled = np.zeros((dst_height, dst_width), dtype=dst_meta['dtype'])
+
+    # resample into the new empty arrays
+    rasterio.warp.reproject(spatial_arr, spatial_resampled, src_transform=spatial_meta['transform'],
+                            dst_transform=dst_transform,
+                            src_crs=spatial_meta['crs'], dst_crs=dst_meta['crs'], src_nodata=spatial_meta['nodata'],
+                            dst_nodata=spatial_meta['nodata'], resampling=Resampling.nearest)
+
+    rasterio.warp.reproject(temporal_arr, temporal_resampled, src_transform=temporal_meta['transform'],
+                            dst_transform=dst_transform,
+                            src_crs=temporal_meta['crs'], dst_crs=dst_meta['crs'], src_nodata=temporal_meta['nodata'],
+                            dst_nodata=dst_meta['nodata'], resampling=Resampling.nearest)
+    assert spatial_resampled.shape == temporal_resampled.shape
+
+    # take the pixels that are marked as having change in either figure and use that as a mask for the temporal change
+    mask = np.logical_and(spatial_resampled > 0, (temporal_resampled > 0))  # 1 where valid (mult. by 255 for dataset mask)
+    # TODO: ideally figure out how to make the mask works, but keep the next line if needed
+    temporal_resampled = temporal_resampled * mask
+
+    dst_meta['nodata'] = 0
+    # write out a version of the resampled temporal breaks using this as a mask
+    with rasterio.open(os.path.join(outdir, outname), 'w', **dst_meta) as dst:
+        dst.write_mask(mask.astype('uint8') * 255)  # 255 indicates valid regions
+        dst.write_band(1, temporal_resampled)
+
+    return os.path.join(outdir, outname)
+
+
+def clean_noisy_raster(raster_path, sieve_size=1, erode_size=3, outname="cleaned.tif", outdir=None):
+    """
+    Clean up a noisy change/no-change raster by removing small features.
+    Output is binary change/no-change GeoTiff.
+    :param raster_path: (str) raster to clean. Should be a change raster - binary or other small dtype.
+    :param sieve_size:
+    :param erode_size:
+    :param outname:
+    :param outdir:
+    :return:
+    """
+    if not outdir:
+        outdir = os.path.split(raster_path)[0]
+
+    with rasterio.open(raster_path, 'r') as src:
+        meta = src.meta
+        msk = src.dataset_mask()
+        original_arr = src.read()
+
+    sieved_msk = rasterio.features.sieve(msk, sieve_size, connectivity=8)  # sieve to remove small features
+
+    original_arr_bi = np.where(original_arr <= 0, 0, 1)  # convert to binary change/no-change
+
+    eroded_img = scipy.ndimage.binary_erosion(original_arr_bi[0, :, :], iterations=erode_size)  # erode by erode_size
+    reconstruct_img = scipy.ndimage.binary_propagation(eroded_img,
+                                                       mask=original_arr_bi[0, :, :])  # propagate until change stops
+    tmp = np.logical_not(reconstruct_img)
+    eroded_tmp = scipy.ndimage.binary_erosion(tmp, iterations=erode_size)
+    filtered_array = np.logical_not(scipy.ndimage.binary_propagation(eroded_tmp, mask=tmp))
+
+    final_out = filtered_array[np.newaxis, :, :].astype('int16')
+    # take original_arr and combine it with filtered_array
+    final_out = np.where(final_out == 1, original_arr, 0).astype('int16')
+    meta['nodata'] = 0
+    meta['dtype'] = 'int16'
+
+    with rasterio.open(os.path.join(outdir, outname), 'w', **meta) as dst:
+        dst.write(final_out)
+        dst.write_mask(sieved_msk)
+
+    return os.path.join(outdir, outname)
+
+
+def spatial_language(change_img, buffer_size=250, save_metrics=True, outname_metrics="metrics.json",
+                     outname="vectorized_change.shp", outdir=None):
+    """
+    Apply spatial language to create a vector with change, islands, and matrix.
+    Save a shapefile with change information.
+    Optionally also save a dictionary with some calculated spatial fire metrics.
+    :param change_img: (path) raster, preferably binary change/no-change and clipped to AOI
+    :param buffer_size: (int) meters. Used in calculating matrix
+    :param save_metrics: (bool) save a dictionary with some spatial fire metrics to a JSON
+    :param outname_metrics: (str) just name, not path
+    :param outname: (str) name for output shapefile. just name, not path.
+    :param outdir: (str) directory for all outputs.
+    :return:
+    """
+    if not outdir:
+        outdir = os.path.split(change_img)[0]
+    with rasterio.open(change_img, 'r') as src:
+        final_out = src.read()
+        meta = src.meta
+    final_out = np.where(final_out >= 1, 1, 0)
+    meta['nodata'] = 0
+    meta['dtype'] = 'int16'
+    # from an online cookbook
+    shapes = ({'properties': {'raster_val': v}, 'geometry': s}
+              for i, (s, v)
+              in enumerate(
+        rasterio.features.shapes(final_out, mask=final_out.astype('bool'), transform=meta['transform'])))
+    shapes_list = []
+    for shape in shapes:
+        shapes_list.append(shape)
+    collection = geojson.FeatureCollection(shapes_list)
+
+    # get the interiors
+    change_gdf = gpd.GeoDataFrame.from_features(collection['features'], crs=meta['crs'])
+
+    # simplifying change geometry
+    changed_polys = []
+    for poly in change_gdf.unary_union:
+        changed_polys.append(poly)
+    change_gdf = gpd.GeoDataFrame(changed_polys, columns=['geometry'], crs=meta['crs'])
+
+    # get interiors
+    interiors = change_gdf.interiors
+    interior_rings = []
+    for poly in interiors:
+        if poly:
+            interior_rings = interior_rings + poly
+
+    # convert from LinearRings into Polygons
+    interior_polys = []
+    for ring in interior_rings:
+        interior_polys.append(Polygon(ring))
+
+    # convert from list to GeoDataFrame
+    interiors_gdf = gpd.GeoDataFrame(interior_polys, columns=['geometry'], crs=meta['crs'])
+
+    change_buff = change_gdf.buffer(buffer_size)
+    change_debuff = change_buff.buffer(-1*buffer_size)
+    change_debuff = change_debuff.unary_union
+
+    # convert multipolygon into geoseries
+    tmp_df = gpd.GeoDataFrame(columns=['geometry'])
+    for geom in range(len(change_debuff)):
+        tmp_df.loc[geom, 'geometry'] = change_debuff[geom]
+
+    # turn into a GeoDataFrame
+    matrix_extended = gpd.GeoDataFrame(tmp_df, columns=['geometry'], crs=meta['crs'])
+
+    # difference with interiors
+    matrix_mp = matrix_extended['geometry'].difference(interiors_gdf.unary_union)
+
+    # difference with changed areas
+    matrix_mp = matrix_mp.buffer(0).difference(change_gdf.unary_union.buffer(0))
+
+    matrix_gdf = gpd.GeoDataFrame(matrix_mp, columns=['geometry'], crs=meta['crs'])
+    matrix_gdf = matrix_gdf.dropna(how='any', axis=0)  # end up with some None values otherwise
+
+    # simplify the geometry
+    tmp = []
+    for poly in matrix_gdf.unary_union:
+        if poly:
+            tmp.append(poly)
+    matrix_gdf = gpd.GeoDataFrame(tmp, columns=['geometry'], crs=meta['crs'])
+
+    change_gdf['classification'] = 'disturbed'
+    interiors_gdf['classification'] = 'undisturbed'
+    matrix_gdf['classification'] = 'matrix'
+    combined_gdf = gpd.GeoDataFrame(pd.concat([change_gdf, interiors_gdf, matrix_gdf]), crs=meta['crs'])
+    combined_gdf.to_file(os.path.join(outdir, outname))
+
+    if save_metrics:
+        # prepare to export all these metrics for later
+        largest_patch = change_gdf.area.max() / 10000.
+        num_patch = len(change_gdf)
+        num_island = len(interiors_gdf)
+        rdpd = len(change_gdf) / (change_gdf.area.sum() / 1000000.)  # num disturbed patches per 100 ha of event
+        ldpi = change_gdf.area.max() / change_gdf.area.sum()
+        event_area = (change_gdf.area.sum() + interiors_gdf.area.sum() + matrix_gdf.area.sum()) / 10000.
+        frac_change = change_gdf.area.sum() / event_area / 10000.
+        frac_islands = interiors_gdf.area.sum() / event_area / 10000.
+        frac_matrix = matrix_gdf.area.sum() / event_area / 10000.
+        # shape index = (perimeter/area) / (perimeter of square with area of EA)
+        shape_index = combined_gdf.unary_union.length / (4*np.sqrt(combined_gdf.unary_union.area))
+
+        # stick them all in a dictionary to export to json
+        metrics = dict()
+        metrics["largest_patch"] = largest_patch
+        metrics["num_patch"] = num_patch
+        metrics["num_island"] = num_island
+        metrics["rdpd"] = rdpd
+        metrics["ldpi"] = ldpi
+        metrics["event_area"] = event_area
+        metrics["frac_change"] = frac_change
+        metrics["frac_islands"] = frac_islands
+        metrics["frac_matrix"] = frac_matrix
+        metrics["shape_index"] = shape_index
+        # save to a JSON
+        with open(os.path.join(outdir, outname_metrics), 'w') as fp:
+            json.dump(metrics, fp)
+
     return os.path.join(outdir, outname)
