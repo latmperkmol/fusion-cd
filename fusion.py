@@ -115,7 +115,7 @@ def clip_to_shapefile(raster, shapefile, outname="clipped_raster.tif", outdir=No
 def make_shapefile_from_raster(raster, outname="vectorized.shp", outdir=None):
     """
     Generate a shapefile with a single feature outlining the extent of the input raster.
-    There is probably a better way to do this, but this works...
+    NB: this only works well if there are no no-data areas within the main raster extent (i.e. only around the edges)
 
     :param raster: (str) path to raster to vectorize
     :param outname: (str) name of the generated shapefile
@@ -335,14 +335,11 @@ def buffer_and_downsample(target_image, reference_image, outname="reprojected.ti
     with rasterio.open(target_image, 'r') as src:
         tgt_data = src.read()
         tgt_meta = src.profile
-    tgt_resolution = tgt_meta['transform'][0]  # in meters. Assumes square pixels
     with rasterio.open(reference_image, 'r') as src:
         ref_meta = src.profile
     dst_res = ref_meta['transform'][0]   # destination resolution in meters. Assumes square pixels
-    left = ref_meta['transform'][2]
-    top = ref_meta['transform'][5]
-    right = left + ref_meta['width']*dst_res
-    bottom = top + ref_meta['height']*dst_res
+    left = ref_meta['transform'][2]  # western extent of reference_image
+    top = ref_meta['transform'][5]  # northern extent of reference_image
     new_transform = affine.Affine(dst_res, 0., left, 0., -1.*dst_res, top)  # transformation for new image to be saved
     dst_raster = np.zeros((ref_meta['count'], ref_meta['height'], ref_meta['width']), dtype=dst_dtype)  # store data
     # reproject the data from target_image into the array dst_raster using the new transformation and the resolution of
@@ -667,10 +664,10 @@ def calculate_indices(filepath, outdir=None):
         # also mask any values less than -1.0 or greater than +1.0
         ndvi = ma.masked_outside(((nir - red) / (nir + red)) * msk / 255., -1.0, 1.0)
         ngrvi = ma.masked_outside(((green - red) / (green + red)) * msk / 255., -1.0, 1.0)
-        arvi = ma.masked_outside(((nir - 2 * red + blue) / (nir + blue)) * msk / 255., -1.0, 1.0)
+        arvi = ma.masked_outside(((nir - 2*red + blue) / (nir + 2*red - blue)) * msk / 255., -1.0, 1.0)
         varig = ma.masked_outside(((green - red) / (green + red - blue)) * msk / 255., -1.0, 1.0)
         # actually makes more sense to invert the version of this index that was used by Goodbody et al 2018
-        gli_b = ma.masked_outside((-1.0*(2*blue - red - green) / (2*blue + red + green)) * msk / 255., -1.0, 1.0)
+        gli_b = ma.masked_outside((-1.0*(2*blue - red - green) / (2*blue + red + green)) * msk / 255., -1.0, 1.0) # inv.
     # create new filename
     filepath_out = os.path.join(outdir, os.path.split(filepath)[1][:-4] + "_VIs.tif")
     # update the meta
@@ -875,7 +872,6 @@ def combine_change_images(temporal_path, spatial_path, outname, outdir=None, inc
 
     # take the pixels that are marked as having change in either figure and use that as a mask for the temporal change
     mask = np.logical_and(spatial_resampled > 0, (temporal_resampled > 0))  # 1 where valid (mult. by 255 for dataset mask)
-    # TODO: ideally figure out how to make the mask works, but keep the next line if needed
     temporal_resampled = temporal_resampled * mask
 
     dst_meta['nodata'] = 0
@@ -936,7 +932,7 @@ def spatial_language(change_img, buffer_size=250, save_metrics=True, outname_met
     Apply spatial language to create a vector with change, islands, and matrix.
     Save a shapefile with change information.
     Optionally also save a dictionary with some calculated spatial fire metrics.
-    :param change_img: (path) raster, preferably binary change/no-change and clipped to AOI
+    :param change_img: (path) raster, preferably binary change/no-change (True/False) and clipped to AOI
     :param buffer_size: (int) meters. Used in calculating matrix
     :param save_metrics: (bool) save a dictionary with some spatial fire metrics to a JSON
     :param outname_metrics: (str) just name, not path
@@ -1051,3 +1047,48 @@ def spatial_language(change_img, buffer_size=250, save_metrics=True, outname_met
             json.dump(metrics, fp)
 
     return os.path.join(outdir, outname)
+
+
+def check_segs_for_decrease(sorted_dates, segs_arr, keepers_arr, start_date="20170528", end_date="20171005",
+                            ref_date_str="20160101"):
+    """
+
+    :param sorted_dates:
+    :param segs_arr:
+    :param keepers_arr:
+    :param start_date:
+    :param end_date:
+    :param ref_date_str: date from which all dates in sorted_dates are counted. You probably don't want to change this
+    :return:
+    """
+    ref_date_obj = datetime.date(year=int(ref_date_str[0:4]), month=int(ref_date_str[4:6]), day=int(ref_date_str[6:8]))
+    start_date_obj = datetime.date(year=int(start_date[0:4]), month=int(start_date[4:6]), day=int(start_date[6:8]))
+    end_date_obj = datetime.date(year=int(end_date[0:4]), month=int(end_date[4:6]), day=int(end_date[6:8]))
+
+    date_objects_sorted = []
+    start_idx = []
+    end_idx = []
+    for i, day in enumerate(sorted_dates):
+        date_objects_sorted.append(ref_date_obj + datetime.timedelta(days=int(day)))
+        if date_objects_sorted[i] == start_date_obj:
+            start_idx = i  # index in sorted_dates corresponding to the starting date in our analysis
+        if date_objects_sorted[i] == end_date_obj:
+            end_idx = i  # index in sorted_dates corresponding to the ending date in our analysis
+    # if these did not get defined, then we need to break
+    assert start_idx
+    assert end_idx
+    start_date_val = sorted_dates[start_idx]  # integer, counted up from first day of sorted_dates
+    end_date_val = sorted_dates[end_idx]
+
+    dates = sorted_dates[keepers_arr.astype('bool')]
+    if len(dates) <= 3:  # error handling for pixels where the series is filled with 0s or too short to fit segs
+        return 0
+    if dates[0] > start_date_val:  # if our first usable image is after start_date
+        return 0  # return 0
+    x = np.arange(dates[0], dates[-1])  # every day from the beginning to the end of 'dates'
+    y = np.interp(x, dates, segs_arr)  # linear interpolation at daily frequency. Essentially makes segments 'concrete'
+
+    idx_start = int(np.argwhere(x == start_date_val))  # index of the segments corresponding to our start date
+    idx_end = int(np.argwhere(x == end_date_val))
+    delta = y[idx_end] - y[idx_start]  # ndvi of the point on the segment
+    return delta
