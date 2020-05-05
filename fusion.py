@@ -29,6 +29,7 @@ import geojson
 import json
 import geopandas as gpd
 from shapely.geometry import Polygon
+import logging
 from shapely.geometry import LinearRing
 # weird and janky, but works until these libraries are combined
 try:
@@ -38,6 +39,8 @@ except ModuleNotFoundError:
     sys.path.insert(1, r"C:\Users\nleach\PycharmProjects\untitled")
     from despike import despike
     import segment_fitter as sf
+
+log = logging.getLogger(__name__)
 
 
 def qa_mask(qa_band):
@@ -71,14 +74,25 @@ def read_hdf_to_arr(hdf_path, band, datatype=np.int16):
 
 def get_hdf_transform(hdf_path):
     if os.path.isfile(hdf_path):
-        src = gdal.Open(hdf_path)
-        band_ds = gdal.Open(src.GetSubDatasets()[0][0], gdal.GA_ReadOnly)
-        prj = band_ds.GetProjection()
-        srs = osr.SpatialReference(wkt=prj)
-        return prj, srs
+        if ".S30" in os.path.split(hdf_path)[1]:
+            product = "S30"
+        elif ".L30" in os.path.split(hdf_path)[1]:
+            product = "L30"
+        else:
+            log.exception("Can't identify product")
+        hdr_path = hdf_path + ".hdr"
+        print(hdr_path)
+        if not os.path.exists(hdr_path):
+            log.exception("Couldn't find hdr file: {}".format(hdr_path))
+        else:
+            with open(hdr_path, 'r') as f:
+                guts = f.read()
+                pieces = guts.split('\n')
+                crs = pieces[11].split('=')
+                crs = crs[1][2:-1]
+                return crs
     else:
-        print("That file does not exist")
-        return
+        log.exception("That file does not exist")
 
 
 def clip_to_shapefile(raster, shapefile, outname="clipped_raster.tif", outdir=None):
