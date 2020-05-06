@@ -20,8 +20,7 @@ import pandas as pd
 from shapely.geometry import shape
 import datetime
 import gdal
-import osr
-from osgeo.gdalconst import GDT_UInt16
+import warnings
 import time
 import multiprocessing as mp
 import scipy.ndimage
@@ -56,23 +55,33 @@ def qa_mask(qa_band):
     return out
 
 
-def read_hdf_to_arr(hdf_path, band, datatype=np.int16):
+def read_hdf_to_arr(hdf_path, bands, datatype=np.int16):
     """
     Functionalizing the process of reading HDF files into arrays
     read a single band out of the hdf and load it into a numpy array
     """
     if os.path.isfile(hdf_path):
-        src = gdal.Open(hdf_path)
-        band_ds = gdal.Open(src.GetSubDatasets()[band][0], gdal.GA_ReadOnly)
-        band_array = band_ds.ReadAsArray().astype(datatype)
-        del src
-        return band_array
+        if type(bands) in (list, tuple, np.ndarray):  # if multiple bands are passed
+            arr = []
+            src = gdal.Open(hdf_path)
+            for band in bands:
+                band_ds = gdal.Open(src.GetSubDatasets()[band][0], gdal.GA_ReadOnly)
+                band_array = band_ds.ReadAsArray().astype(datatype)
+                arr.append(band_array)
+            del src
+            arr = np.array(arr)
+            return arr
+        else:
+            src = gdal.Open(hdf_path)
+            band_ds = gdal.Open(src.GetSubDatasets()[bands][0], gdal.GA_ReadOnly)
+            band_array = band_ds.ReadAsArray().astype(datatype)
+            return band_array
     else:
-        print("That file does not exist")
+        warnings.warn("{} does not exist".format(hdf_path))
         return
 
 
-def get_hdf_transform(hdf_path):
+def get_hdf_crs(hdf_path):
     if os.path.isfile(hdf_path):
         if ".S30" in os.path.split(hdf_path)[1]:
             product = "S30"
@@ -90,9 +99,73 @@ def get_hdf_transform(hdf_path):
                 pieces = guts.split('\n')
                 crs = pieces[11].split('=')
                 crs = crs[1][2:-1]
-                return crs
+                transform = pieces[10].split('=')
+                transform_list = transform[1].strip()[1:].split(',')
+                ulx = transform_list[3].strip()
+                uly = transform_list[4].strip()
+                resx = transform_list[5].strip()  # resolution
+                resy = transform_list[6].strip()
+                transform = [ulx, uly, resx, resy]
     else:
         log.exception("That file does not exist")
+    return crs, transform
+
+
+def convert_hdf_to_tif(hdf_path, outdir, bands, apply_qa_mask=False, nodataval=-1000):
+    """
+    :param hdf_path:
+    :param outdir:
+    :param bands: list-like
+    :return:
+    """
+    if apply_qa_mask:
+        qa_arr = read_hdf_to_arr(hdf_path, 13)
+        qa_mask_arr = qa_mask(qa_arr)
+        negatives = np.zeros_like(qa_mask_arr, dtype=bool, subok=False)  # get the dimensions of the image from the QA mask
+        arr = np.zeros((len(bands), np.shape(qa_mask_arr)[0], np.shape(qa_mask_arr)[1]))  # pre-allocate
+        # apply QA mask and remove all negative values
+        for count, b in enumerate(bands):
+            tmp_band = read_hdf_to_arr(hdf_path, b)
+            tmp = ma.masked_array(tmp_band, qa_mask_arr.mask)
+            arr[count, :, :] = ma.filled(tmp, nodataval)  # fill mask using nodata value. add to 'arr' to create a 4-band image
+            # find all the negative pixels
+            negatives = negatives + (tmp_band < 0)  # True where there are negative values. False elsewhere.
+        arr = ma.masked_array(arr, mask=np.broadcast_to(negatives[np.newaxis, :, :], arr.shape))
+        arr = ma.filled(arr, nodataval)
+
+    else:
+        arr = []
+        negatives = []
+        for count, b in enumerate(bands):
+            tmp_band = read_hdf_to_arr(hdf_path, b)
+            if count == 0:
+                # need to get dimensions
+                arr = np.zeros((len(bands), tmp_band.shape[0], tmp_band.shape[1]))
+                negatives = np.zeros_like(arr, dtype=bool, subok=False)
+            arr[count, :, :] = ma.filled(tmp_band, nodataval)
+            negatives = negatives + (tmp_band < 0)
+        arr = ma.masked_array(arr, negatives)
+        arr = ma.filled(arr, nodataval)
+
+    with rasterio.open(hdf_path) as src:
+        kwds = src.profile
+
+    kwds['nodata'] = nodataval
+    kwds['driver'] = 'GTiff'
+    kwds['dtype'] = rasterio.int16
+    kwds['width'] = arr.shape[2]
+    kwds['height'] = arr.shape[1]
+    kwds['count'] = arr.shape[0]
+    crs, transform = get_hdf_crs(hdf_path)
+    kwds['crs'] = crs
+    kwds['transform'] = rasterio.transform.from_origin(float(transform[0]), float(transform[1]),
+                                                       float(transform[2]), float(transform[3]))
+    outname = os.path.splitext(os.path.split(hdf_path)[1])[0] + ".tif"
+    outpath = os.path.join(outdir, outname)
+    with rasterio.open(outpath, 'w', **kwds) as dst:
+        dst.write(np.array(arr).astype(rasterio.int16))
+
+    return outpath
 
 
 def clip_to_shapefile(raster, shapefile, outname="clipped_raster.tif", outdir=None):
